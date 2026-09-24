@@ -53,6 +53,7 @@ DATABASE_PATH=./hydroponic.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/recipes/{id}/versions/{v}/export` | **导出该版本 JSON 文件** |
 | POST | `/api/recipes/{id}/versions/{v}/dispense-plan` | **整数泵送投料方案**：按各浓缩液单次泵送量（mL）求整数泵次，最小化各元素最大相对偏差 |
 | POST | `/api/recipes/{id}/versions/{v}/consumption-forecast` | **库存消耗预测**：按灌溉计划逐批次等比例扣减浓缩液，输出每日消耗/剩余与首个不足日期（支持 `suspended_dates` 本地停灌日） |
+| POST | `/api/recipes/{id}/versions/{v}/procurement-plan` | **整包补货采购**：按灌溉批次求最低总价的整包采购组合（同价取总包数最少），无解时给出最早缺口批次 |
 | POST | `/api/irrigation/plan` | **灌溉计划**：按 IANA 时区生成逐日执行批次（DST/跨午夜/容量校验/本地停灌日） |
 | GET | `/health` | 健康检查 |
 
@@ -668,6 +669,186 @@ curl -s -X POST \
 - **404**：配方不存在、或该配方下版本不存在（如 `/api/recipes/1/versions/99/...`）；
 - **422**：库存名称未知（`未知浓缩液：C液`）、缺少某液（`库存缺少…浓缩液`）、库存为负或名称重复；以及灌溉计划参数的全部校验失败（非法时区/日期、空或重复时段、非正时长/水量、`suspended_dates` 重复或超出日期范围、多余字段）。
 
+## 整包补货采购（POST /api/recipes/{id}/versions/{v}/procurement-plan）
+
+给定一个已保存的**配方版本**、一套灌溉计划参数、各浓缩液**当前库存**与若干**整包报价**，服务复用灌溉批次展开（DST/跨午夜/合并/停灌）与版本求解结果（`allocations` / `total_volume_ml`），求一份**最低总价的整包采购组合**，保证每个实际灌溉批次扣减后各浓缩液库存都不为负。
+
+- **按批次实际水量计需求**：某批水量 `W`（mL，合并后总水量）对浓缩液 i 的需求 = 版本中该液分配体积 `a_i` ÷ 配方目标总体积 `V` × `W`；合并批次按合并后水量整体计一次。
+- **到货时点**：报价在到货**本地日期的首个批次前**入库——即使当天首个批次本地 `00:00` 开始也能用上；到货日早于 `start_date` 的报价直接计入期初可用量；晚于计划最后一批的补货永远不会被采用。
+- **跨午夜只扣一次**：批次在其**本地开始时刻**扣减并归属本地开始日：`23:55` 开始、跨入次日 `00:05` 的批次只在开始日扣一次，**次日才到货的报价对它不可用**。
+- **停灌日到货**：到货日恰为停灌日（当日无批次）时，货物视为该日凌晨已入库，顺延给**下一个有批次的本地日**的首个批次使用。
+- **优化目标**：非负**整数包数**、受 `max_packages` 上限约束的整数线性规划（HiGHS，两阶段）——先最小化**总价**，再在最优总价下最小化**总包数**（确定性、收货动作最少的方案）。
+- **无解不伪造采购单**：当到货时点或供应上限使任何采购组合都无法覆盖计划时，接口仍返回 **200** 且 `feasible=false`，各报价的 `packages/volume_ml/cost` 全部为 `null`，并在 `first_shortfall` 给出**最早出现缺口的批次**及该批缺口的浓缩液（需求、买到上限时的可达量、缺口）。
+
+### 请求
+
+计划参数（`timezone` / `start_date` / `end_date` / `sessions` / `suspended_dates`）与 `stock` 的含义、校验与[库存消耗预测](#库存消耗预测post-apirerecipesidversionsvconsumption-forecast)完全一致（本接口不接收 `daily_capacity_ml`）。`quotes` 为整包报价列表，同一浓缩液可以有多个报价（允许同日、同价、同容量的多条报价）：
+
+| 字段 | 说明 |
+| ---- | ---- |
+| `concentrate` | 浓缩液名称，必须与版本求解结果 `allocations[].concentrate` 匹配 |
+| `package_ml` | 整包装容量（mL/包），有限**正数**，数字（不接受 `"1000"`、`0`、负数、`NaN`、`Infinity`） |
+| `price` | 整包单价（任意统一货币），有限**正数**，数字 |
+| `arrival_date` | 到货**本地日期** `YYYY-MM-DD`（按 `timezone` 解释）；该日首个批次前入库 |
+| `max_packages` | 最多可购包数，非负整数；`null` 或缺省表示**不限量**，`0` 表示该报价一包都买不到 |
+
+```bash
+curl -s -X POST \
+  http://localhost:8000/api/recipes/1/versions/1/procurement-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "timezone": "Asia/Shanghai",
+    "start_date": "2026-05-01",
+    "end_date": "2026-05-02",
+    "sessions": [
+      {"start_time": "08:00", "duration_minutes": 10, "water_ml": 10000}
+    ],
+    "stock": [
+      {"concentrate": "A液", "stock_ml": 0},
+      {"concentrate": "B液", "stock_ml": 0}
+    ],
+    "quotes": [
+      {"concentrate": "A液", "package_ml": 1000, "price": 100,
+       "arrival_date": "2026-05-01", "max_packages": 2},
+      {"concentrate": "A液", "package_ml": 1500, "price": 95,
+       "arrival_date": "2026-05-01"},
+      {"concentrate": "A液", "package_ml": 1500, "price": 60,
+       "arrival_date": "2026-05-02"},
+      {"concentrate": "B液", "package_ml": 125, "price": 50,
+       "arrival_date": "2026-05-01"},
+      {"concentrate": "B液", "package_ml": 125, "price": 30,
+       "arrival_date": "2026-05-02"}
+    ]
+  }'
+```
+
+该版本每 10 L 水用 **A 液 1500 mL、B 液 125 mL**。5 月 1 日、2 日各一批（每批 10 L），故两天各需 A 1500 / B 125；5 月 2 日的便宜报价赶不上第一天的批次，只能各买一包当日到货的较贵报价：
+
+```json
+{
+  "recipe_id": 1,
+  "version": 1,
+  "recipe_feasible": true,
+  "warning": null,
+  "timezone": "Asia/Shanghai",
+  "start_date": "2026-05-01",
+  "end_date": "2026-05-02",
+  "batch_count_before_merge": 2,
+  "batch_count_after_merge": 2,
+  "planned_water_ml": 20000.0,
+  "feasible": true,
+  "total_cost": 235.0,
+  "total_packages": 4,
+  "quotes": [
+    {"index": 1, "concentrate": "A液", "package_ml": 1000.0, "price": 100.0,
+     "arrival_date": "2026-05-01", "max_packages": 2,
+     "packages": 0, "volume_ml": 0.0, "cost": 0.0},
+    {"index": 2, "concentrate": "A液", "package_ml": 1500.0, "price": 95.0,
+     "arrival_date": "2026-05-01", "max_packages": null,
+     "packages": 1, "volume_ml": 1500.0, "cost": 95.0},
+    {"index": 3, "concentrate": "A液", "package_ml": 1500.0, "price": 60.0,
+     "arrival_date": "2026-05-02", "max_packages": null,
+     "packages": 1, "volume_ml": 1500.0, "cost": 60.0},
+    {"index": 4, "concentrate": "B液", "package_ml": 125.0, "price": 50.0,
+     "arrival_date": "2026-05-01", "max_packages": null,
+     "packages": 1, "volume_ml": 125.0, "cost": 50.0},
+    {"index": 5, "concentrate": "B液", "package_ml": 125.0, "price": 30.0,
+     "arrival_date": "2026-05-02", "max_packages": null,
+     "packages": 1, "volume_ml": 125.0, "cost": 30.0}
+  ],
+  "liquids": [
+    {"concentrate": "A液", "initial_stock_ml": 0.0, "initial_available_ml": 0.0,
+     "mix_ml_per_l": 150.0, "total_required_ml": 3000.0,
+     "purchased_ml": 3000.0, "capped_supply_ml": null, "final_remaining_ml": 0.0},
+    {"concentrate": "B液", "initial_stock_ml": 0.0, "initial_available_ml": 0.0,
+     "mix_ml_per_l": 12.5, "total_required_ml": 250.0,
+     "purchased_ml": 250.0, "capped_supply_ml": null, "final_remaining_ml": 0.0}
+  ],
+  "batches": [
+    {
+      "index": 1,
+      "local_start": "2026-05-01T08:00:00+0800",
+      "local_end": "2026-05-01T08:10:00+0800",
+      "attributed_date": "2026-05-01",
+      "water_ml": 10000.0,
+      "merged": false, "crosses_midnight": false,
+      "inbound": [
+        {"quote_index": 2, "concentrate": "A液", "packages": 1, "volume_ml": 1500.0},
+        {"quote_index": 4, "concentrate": "B液", "packages": 1, "volume_ml": 125.0}
+      ],
+      "liquids": [
+        {"concentrate": "A液", "required_ml": 1500.0, "remaining_ml": 0.0},
+        {"concentrate": "B液", "required_ml": 125.0, "remaining_ml": 0.0}
+      ],
+      "sufficient": true
+    },
+    {
+      "index": 2,
+      "local_start": "2026-05-02T08:00:00+0800",
+      "attributed_date": "2026-05-02",
+      "water_ml": 10000.0,
+      "inbound": [
+        {"quote_index": 3, "concentrate": "A液", "packages": 1, "volume_ml": 1500.0},
+        {"quote_index": 5, "concentrate": "B液", "packages": 1, "volume_ml": 125.0}
+      ],
+      "liquids": [/* 1500 / 125 需求，扣完剩余 0 */],
+      "sufficient": true
+    }
+  ],
+  "first_shortfall": null,
+  "message": "采购组合求解成功：……最低总价 235，共采购 4 包（同价已取总包数最少）。"
+}
+```
+
+要点：
+
+- `quotes[].packages` 为各报价的采购包数（未选用为 `0`），`volume_ml = package_ml × packages`、`cost = price × packages`；顶层 `total_cost = Σ cost`。
+- 整包无法整除需求时会**多买余量**（剩余库存体现在末批 `remaining_ml` 与 `liquids[].final_remaining_ml` 中），不会少买导致缺口；同价方案优先选总包数少的。
+- `batches[].inbound` 只在到货日本地**首个批次**上登记（同日后续批次不再重复入库）；到货早于计划的报价不出现在任何批次的 `inbound`，而计入 `liquids[].initial_available_ml`。
+- `batches[].liquids[].remaining_ml` 是该批**到货入库并扣减后**的库存，恒非负；`sufficient` 在可求解方案中恒为 `true`。
+- 库存本身已足够时可以不传或传空 `quotes`：返回全 0 采购、`total_cost = 0`。
+
+### 无解响应（报价时点 / 供应上限）
+
+把上例改成「所有报价 5 月 2 日才到货」（或 A 液报价 `max_packages` 使总供货不足 3000 mL），则第一天的批次就无法覆盖——接口**不返回任何采购包数**：
+
+```json
+{
+  "feasible": false,
+  "total_cost": null,
+  "total_packages": null,
+  "quotes": [
+    {"index": 1, "concentrate": "A液", "package_ml": 1500.0, "price": 60.0,
+     "arrival_date": "2026-05-02", "max_packages": null,
+     "packages": null, "volume_ml": null, "cost": null}
+  ],
+  "first_shortfall": {
+    "batch_index": 1,
+    "start_utc": "2026-05-01T00:00:00Z",
+    "local_start": "2026-05-01T08:00:00+0800",
+    "local_end": "2026-05-01T08:10:00+0800",
+    "attributed_date": "2026-05-01",
+    "water_ml": 10000.0,
+    "liquids": [
+      {"concentrate": "A液", "required_ml": 1500.0,
+       "available_ml": 0.0, "shortfall_ml": 1500.0},
+      {"concentrate": "B液", "required_ml": 125.0,
+       "available_ml": 0.0, "shortfall_ml": 125.0}
+    ],
+    "message": "即使把所有报价都按上限采购，第 1 个批次（……）的 A液、B液 仍出现缺口；未生成任何采购单，请增加报价、放宽供应上限或安排更早的到货。"
+  },
+  "message": "无满足全部批次扣减后库存非负的整包采购组合：……未生成采购单；最早缺口见 first_shortfall。"
+}
+```
+
+- `first_shortfall` 定位**按执行顺序最早**无法覆盖的批次；同一批多个浓缩液同时不足时在 `liquids[]` 中**全部列出**（各自 `required_ml / available_ml / shortfall_ml`，`available_ml` 是把所有报价买到上限后该批扣减前的可达库存）。
+- 诊断轨迹 `batches[]` 照常完整返回（水量/需求不截断，剩余恒非负），但 `quotes[].packages` 一律为 `null`，提醒调用方调整报价后重新下单。
+
+错误码：
+
+- **404**：配方不存在、或该配方下版本不存在。
+- **422**：库存或报价名称与版本不匹配（未知浓缩液 / 缺少某液 / 库存名称重复 / 库存为负）、`package_ml` 或 `price` 非正或非有限值（`0`、负数、`"1000"`、`NaN`、`Infinity`）、`max_packages` 为负或非整数、`arrival_date` 不是合法日期，以及灌溉计划参数的全部校验失败（非法时区/日期、空或重复时段、非正时长/水量、停灌日重复或超范围、多余字段）。注意：`quotes` 本身允许为空（库存够时无需采购）。
+
 ## 项目结构
 
 ```
@@ -675,9 +856,10 @@ curl -s -X POST \
 ├── app/
 │   ├── main.py       # FastAPI 路由（试算 / 保存 / 版本 / 导出 / 整数泵送 / 灌溉计划 / 消耗预测）
 │   ├── solver.py     # minimax LP 建模与无可行解诊断
-│   ├── dispense.py   # 整数泵送方案：MILP（HiGHS）求整数泵次、最小化最大相对偏差
+│   ├── dispense.py    # 整数泵送方案：MILP（HiGHS）求整数泵次、最小化最大相对偏差
 │   ├── irrigation.py # 灌溉批次生成：时区/DST 解析、跨午夜、合并、容量校验
 │   ├── forecast.py   # 库存消耗预测：按实际批次等比例扣减、缺口标记、逐日汇总
+│   ├── procurement.py # 整包补货采购：到货时点约束下的整数线性规划（最低总价/最少包数）
 │   ├── models.py     # Pydantic 请求/响应模型
 │   ├── database.py   # SQLite 初始化与配方/版本存取
 │   └── config.py     # 元素清单、默认容差、DB 路径

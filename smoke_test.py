@@ -1089,4 +1089,443 @@ with TestClient(app) as client:
     assert "缺少" in rr.json()["detail"]["message"]
     print("43) dispense-plan 404/422 cases all ok")
 
+    # =================================================================== #
+    # Whole-package replenishment procurement
+    # (POST /api/recipes/{id}/versions/{v}/procurement-plan)
+    # ===================================================================
+    # One full 10 L batch mixes A 1500 mL + B 125 mL (base_request recipe).
+    r = client.post("/api/recipes", json={
+        "name": "采购配方", "note": "procurement", "request": base_request()})
+    assert r.status_code == 201, r.text
+    pc_rid = r.json()["recipe_id"]
+    pc_url = f"/api/recipes/{pc_rid}/versions/1/procurement-plan"
+
+    def pc_body(**overrides) -> dict:
+        body = {
+            "timezone": "Asia/Shanghai",
+            "start_date": "2026-05-01",
+            "end_date": "2026-05-01",
+            "sessions": [{"start_time": "08:00", "duration_minutes": 10,
+                          "water_ml": 10000}],
+            "stock": [
+                {"concentrate": "A液", "stock_ml": 0},
+                {"concentrate": "B液", "stock_ml": 0},
+            ],
+            "quotes": [],
+        }
+        body.update(overrides)
+        return body
+
+    same_day_quotes = [
+        {"concentrate": "A液", "package_ml": 1000, "price": 100,
+         "arrival_date": "2026-05-01", "max_packages": 2},
+        {"concentrate": "A液", "package_ml": 1500, "price": 100,
+         "arrival_date": "2026-05-01", "max_packages": None},
+        {"concentrate": "B液", "package_ml": 125, "price": 50,
+         "arrival_date": "2026-05-01", "max_packages": None},
+    ]
+
+    # 44) minimum cost, tie-break on total packages ---------------------- #
+    d = client.post(pc_url, json=pc_body(quotes=same_day_quotes)).json()
+    assert d["feasible"] is True
+    # A: 1x1500 @100 beats 2x1000 @200 and ties 1x1000 (only 1000 < 1500);
+    # cheapest feasible is exactly one 1500 mL package (100) — fewest packs.
+    assert d["total_cost"] == 150.0
+    assert d["total_packages"] == 2
+    got = {q["index"]: q["packages"] for q in d["quotes"]}
+    assert got == {1: 0, 2: 1, 3: 1}, got
+    b = d["batches"][0]
+    inbound = {x["quote_index"]: (x["concentrate"], x["packages"])
+               for x in b["inbound"]}
+    assert inbound == {2: ("A液", 1), 3: ("B液", 1)}
+    rem = {x["concentrate"]: x["remaining_ml"] for x in b["liquids"]}
+    assert rem == {"A液": 0.0, "B液": 0.0}
+    liq = {x["concentrate"]: x for x in d["liquids"]}
+    assert abs(liq["A液"]["total_required_ml"] - 1500) < 1e-9
+    assert abs(liq["B液"]["mix_ml_per_l"] - 12.5) < 1e-9
+    print("44) procurement min cost + min packs tie-break:",
+          d["total_cost"], d["total_packages"], "packs")
+
+    # 44b) same total price -> strictly fewer packages preferred --------- #
+    d = client.post(pc_url, json=pc_body(quotes=[
+        {"concentrate": "A液", "package_ml": 750, "price": 100,
+         "arrival_date": "2026-05-01"},
+        {"concentrate": "A液", "package_ml": 1500, "price": 100,
+         "arrival_date": "2026-05-01"},
+        {"concentrate": "B液", "package_ml": 125, "price": 50,
+         "arrival_date": "2026-05-01"},
+    ])).json()
+    assert d["feasible"]
+    got = {q["index"]: q["packages"] for q in d["quotes"]}
+    assert got == {1: 0, 2: 1, 3: 1}, got  # 1x1500 not 2x750
+    assert d["total_cost"] == 150 and d["total_packages"] == 2
+    print("44b) equal price -> fewer packages")
+
+    # 44c) cheaper-but-more-packages quote wins on price ----------------- #
+    d = client.post(pc_url, json=pc_body(quotes=[
+        {"concentrate": "A液", "package_ml": 500, "price": 30,
+         "arrival_date": "2026-05-01"},
+        {"concentrate": "A液", "package_ml": 1500, "price": 100,
+         "arrival_date": "2026-05-01"},
+        {"concentrate": "B液", "package_ml": 125, "price": 50,
+         "arrival_date": "2026-05-01"},
+    ])).json()
+    got = {q["index"]: q["packages"] for q in d["quotes"]}
+    # 3x500 @30 = 90 < 100 even though it is 3 packs
+    assert got == {1: 3, 2: 0, 3: 1}, got
+    assert d["total_cost"] == 140
+    print("44c) price dominates package count")
+
+    # 45) stock alone covers the schedule -> zero packages --------------- #
+    d = client.post(pc_url, json=pc_body(stock=[
+        {"concentrate": "A液", "stock_ml": 1500},
+        {"concentrate": "B液", "stock_ml": 125}])).json()
+    assert d["feasible"] and d["total_cost"] == 0 and d["total_packages"] == 0
+    assert d["quotes"] == [] and d["first_shortfall"] is None
+    assert d["batches"][0]["inbound"] == []
+    print("45) sufficient stock -> empty order, cost 0")
+
+    # 46) arrival after the first batch -> infeasible, no fabricated order #
+    d = client.post(pc_url, json=pc_body(
+        end_date="2026-05-02",
+        sessions=[{"start_time": "08:00", "duration_minutes": 10,
+                   "water_ml": 10000}],
+        quotes=[
+            {"concentrate": "A液", "package_ml": 1500, "price": 100,
+             "arrival_date": "2026-05-02"},
+            {"concentrate": "B液", "package_ml": 125, "price": 50,
+             "arrival_date": "2026-05-02"},
+        ])).json()
+    assert d["feasible"] is False
+    assert d["total_cost"] is None and d["total_packages"] is None
+    assert all(q["packages"] is None and q["cost"] is None
+               and q["volume_ml"] is None for q in d["quotes"])
+    fs = d["first_shortfall"]
+    assert fs["batch_index"] == 1
+    assert fs["attributed_date"] == "2026-05-01"
+    assert {x["concentrate"] for x in fs["liquids"]} == {"A液", "B液"}
+    assert all(abs(x["available_ml"]) < 1e-9 for x in fs["liquids"])
+    assert "未生成" in fs["message"]
+    # diagnostic trajectory keeps full batches and non-negative stock
+    assert len(d["batches"]) == 2
+    assert d["batches"][0]["sufficient"] is False
+    assert all(l["remaining_ml"] >= 0 for b in d["batches"] for l in b["liquids"])
+    print("46) late quotes infeasible, earliest gap batch 1, no fake order")
+
+    # 46b) supply cap too small -> shortfall with available/shortfall mL -- #
+    d = client.post(pc_url, json=pc_body(quotes=[
+        {"concentrate": "A液", "package_ml": 1000, "price": 100,
+         "arrival_date": "2026-05-01", "max_packages": 1},
+        {"concentrate": "B液", "package_ml": 125, "price": 50,
+         "arrival_date": "2026-05-01"},
+    ])).json()
+    assert d["feasible"] is False
+    fs = d["first_shortfall"]
+    assert [x["concentrate"] for x in fs["liquids"]] == ["A液"]
+    assert abs(fs["liquids"][0]["available_ml"] - 1000) < 1e-9
+    assert abs(fs["liquids"][0]["shortfall_ml"] - 500) < 1e-9
+    liq = {x["concentrate"]: x for x in d["liquids"]}
+    assert liq["A液"]["capped_supply_ml"] == 1000.0
+    assert liq["A液"]["purchased_ml"] is None
+    print("46b) capped supply reports exact gap (1000 vs 1500)")
+
+    # 46c) early batches covered by stock, gap only on day 2 ------------- #
+    d = client.post(pc_url, json=pc_body(
+        end_date="2026-05-02",
+        stock=[{"concentrate": "A液", "stock_ml": 1500},
+               {"concentrate": "B液", "stock_ml": 125}],
+        quotes=[{"concentrate": "A液", "package_ml": 1500, "price": 100,
+                 "arrival_date": "2026-05-03"},
+                {"concentrate": "B液", "package_ml": 125, "price": 50,
+                 "arrival_date": "2026-05-03"}])).json()
+    assert d["feasible"] is False
+    assert d["first_shortfall"]["batch_index"] == 2
+    print("46c) first shortfall points at the first uncovered batch (2)")
+
+    # 47) arrival is stocked before that day's FIRST local batch --------- #
+    # 08:00 and 08:10:30 merge into one 700 mL batch; a same-day arrival is
+    # available to it; a 00:00 batch must also see same-day arrivals.
+    d = client.post(pc_url, json=pc_body(sessions=[
+        {"start_time": "00:00", "duration_minutes": 5, "water_ml": 10000}],
+        quotes=same_day_quotes)).json()
+    assert d["feasible"] is True and d["total_cost"] == 150.0
+    assert d["batches"][0]["local_start"] == "2026-05-01T00:00:00+0800"
+    assert len(d["batches"][0]["inbound"]) == 2
+    print("47) same-day delivery usable even at local 00:00 batch")
+
+    # 47b) arrival before the horizon folds into initial availability ----- #
+    d = client.post(pc_url, json=pc_body(quotes=[
+        {"concentrate": "A液", "package_ml": 1500, "price": 100,
+         "arrival_date": "2026-04-30"},
+        {"concentrate": "B液", "package_ml": 125, "price": 50,
+         "arrival_date": "2026-04-20"},
+    ])).json()
+    assert d["feasible"] and d["total_cost"] == 150
+    liq = {x["concentrate"]: x for x in d["liquids"]}
+    assert liq["A液"]["initial_available_ml"] == 1500
+    assert liq["B液"]["initial_available_ml"] == 125
+    assert d["batches"][0]["inbound"] == []
+    print("47b) pre-horizon arrivals fold into initial available stock")
+
+    # 48) cross-midnight batch draws once at START; next-day arrival no help #
+    d = client.post(pc_url, json=pc_body(
+        sessions=[{"start_time": "23:55", "duration_minutes": 10,
+                   "water_ml": 10000}],
+        quotes=[
+            {"concentrate": "A液", "package_ml": 1500, "price": 100,
+             "arrival_date": "2026-05-02"},
+            {"concentrate": "B液", "package_ml": 125, "price": 50,
+             "arrival_date": "2026-05-01"},
+        ])).json()
+    assert d["feasible"] is False
+    assert d["batches"][0]["crosses_midnight"] is True
+    assert [x["concentrate"]
+            for x in d["first_shortfall"]["liquids"]] == ["A液"]
+    print("48) cross-midnight batch: 05-02 delivery not usable at 05-01 23:55")
+
+    # 48b) two days with a 23:55 batch each: day-1 batch needs day-1 stock;
+    #      day-2 delivery can still serve day-2's 23:55 batch ------------- #
+    d = client.post(pc_url, json=pc_body(
+        end_date="2026-05-02",
+        sessions=[{"start_time": "23:55", "duration_minutes": 10,
+                   "water_ml": 10000}],
+        quotes=[
+            {"concentrate": "A液", "package_ml": 1500, "price": 100,
+             "arrival_date": "2026-05-01"},
+            {"concentrate": "A液", "package_ml": 1500, "price": 90,
+             "arrival_date": "2026-05-02"},
+            {"concentrate": "B液", "package_ml": 125, "price": 50,
+             "arrival_date": "2026-05-01"},
+            {"concentrate": "B液", "package_ml": 125, "price": 40,
+             "arrival_date": "2026-05-02"},
+        ])).json()
+    assert d["feasible"], d.get("first_shortfall")
+    got = {q["index"]: q["packages"] for q in d["quotes"]}
+    assert got == {1: 1, 2: 1, 3: 1, 4: 1}, got
+    assert d["total_cost"] == 280
+    print("48b) per-day timing: expensive day-1 + cheap day-2 packs")
+
+    # 49) merged batch demand uses the MERGED water; arrivals appear on the
+    #     day's first batch only ----------------------------------------- #
+    d = client.post(pc_url, json=pc_body(sessions=[
+        {"start_time": "08:00", "duration_minutes": 10, "water_ml": 5000},
+        {"start_time": "08:10:30", "duration_minutes": 5, "water_ml": 5000}],
+        quotes=same_day_quotes)).json()
+    assert d["feasible"]
+    assert d["batch_count_before_merge"] == 2
+    assert d["batch_count_after_merge"] == 1
+    b0 = d["batches"][0]
+    assert b0["merged"] and b0["water_ml"] == 10000
+    need = {x["concentrate"]: x["required_ml"] for x in b0["liquids"]}
+    assert abs(need["A液"] - 1500) < 1e-9 and abs(need["B液"] - 125) < 1e-9
+    print("49) merged-batch demand from merged water, single inbound entry")
+
+    # 49b) delivery on a suspended day is usable by the next active day --- #
+    d = client.post(pc_url, json=pc_body(
+        start_date="2026-05-01", end_date="2026-05-03",
+        sessions=[{"start_time": "08:00", "duration_minutes": 10,
+                   "water_ml": 10000}],
+        suspended_dates=["2026-05-02"],
+        stock=[{"concentrate": "A液", "stock_ml": 1500},
+               {"concentrate": "B液", "stock_ml": 125}],
+        quotes=[
+            {"concentrate": "A液", "package_ml": 1500, "price": 100,
+             "arrival_date": "2026-05-02"},
+            {"concentrate": "B液", "package_ml": 125, "price": 50,
+             "arrival_date": "2026-05-02"},
+        ])).json()
+    assert d["feasible"], d.get("first_shortfall")
+    assert len(d["batches"]) == 2
+    assert d["batches"][1]["attributed_date"] == "2026-05-03"
+    assert len(d["batches"][1]["inbound"]) == 2
+    print("49b) suspended-day arrival serves the next active batch")
+
+    # 50) 404 / 422 matrix ------------------------------------------------ #
+    good = pc_body(quotes=same_day_quotes)
+    assert client.post(
+        "/api/recipes/999/versions/1/procurement-plan", json=good
+    ).status_code == 404
+    assert client.post(
+        f"/api/recipes/{pc_rid}/versions/99/procurement-plan", json=good
+    ).status_code == 404
+
+    def pc_422(overrides_or_body, label):
+        body = (overrides_or_body if isinstance(overrides_or_body, dict)
+                and "quotes" in overrides_or_body
+                else pc_body(**overrides_or_body))
+        rr = client.post(pc_url, json=body)
+        assert rr.status_code == 422, (label, rr.status_code, rr.text[:300])
+
+    bad = json.loads(json.dumps(good))
+    bad["quotes"][0]["concentrate"] = "C液"
+    rr = client.post(pc_url, json=bad)
+    assert rr.status_code == 422 and "未知浓缩液" in rr.text
+    bad = json.loads(json.dumps(good))
+    bad["quotes"].append({"concentrate": "C液", "package_ml": 1, "price": 1,
+                          "arrival_date": "2026-05-01"})
+    rr = client.post(pc_url, json=bad)
+    assert rr.status_code == 422 and "未知浓缩液" in rr.text
+    bad = json.loads(json.dumps(good))
+    bad["stock"] = [{"concentrate": "A液", "stock_ml": 0},
+                    {"concentrate": "C液", "stock_ml": 0}]
+    assert client.post(pc_url, json=bad).status_code == 422
+    bad = json.loads(json.dumps(good))
+    bad["stock"] = [{"concentrate": "A液", "stock_ml": 0}]
+    assert client.post(pc_url, json=bad).status_code == 422
+    bad = json.loads(json.dumps(good))
+    bad["stock"] = [{"concentrate": "A液", "stock_ml": 0},
+                    {"concentrate": "A液", "stock_ml": 1},
+                    {"concentrate": "B液", "stock_ml": 0}]
+    assert client.post(pc_url, json=bad).status_code == 422
+    bad = json.loads(json.dumps(good))
+    bad["stock"][0]["stock_ml"] = -1
+    assert client.post(pc_url, json=bad).status_code == 422
+
+    for field, value in [
+        ("package_ml", 0), ("package_ml", -5), ("package_ml", "1500"),
+        ("price", 0), ("price", -1), ("price", "100"),
+        ("max_packages", -1), ("max_packages", 1.5),
+        ("arrival_date", "not-a-date"),
+    ]:
+        bad = json.loads(json.dumps(good))
+        bad["quotes"][0][field] = value
+        assert client.post(pc_url, json=bad).status_code == 422, (field, value)
+    for token in ("NaN", "Infinity"):
+        bad = json.loads(json.dumps(good))
+        bad["quotes"][0]["package_ml"] = None
+        raw = json.dumps(bad).replace(
+            '"package_ml": null', '"package_ml": ' + token, 1)
+        rr = client.post(pc_url, content=raw,
+                         headers={"Content-Type": "application/json"})
+        assert rr.status_code == 422, token
+    bad = json.loads(json.dumps(good))
+    bad["bogus"] = 1
+    assert client.post(pc_url, json=bad).status_code == 422
+    bad = json.loads(json.dumps(good))
+    bad["quotes"][0]["bogus"] = 1
+    assert client.post(pc_url, json=bad).status_code == 422
+    # inherited irrigation-schedule validation
+    pc_422({"timezone": "Mars/Olympus", "quotes": []}, "bad timezone")
+    pc_422({"end_date": "2026-04-30", "quotes": []}, "bad range")
+    pc_422({"sessions": [], "quotes": []}, "empty sessions")
+    pc_422({"suspended_dates": ["2026-05-02", "2026-05-02"],
+            "quotes": []}, "duplicate suspended")
+    # empty quotes alone is legal (stock may suffice)
+    assert client.post(pc_url, json=pc_body(stock=[
+        {"concentrate": "A液", "stock_ml": 1500},
+        {"concentrate": "B液", "stock_ml": 125}])).status_code == 200
+    print("50) procurement 404/422 matrix ok")
+
+    # 51) infeasible (force-saved) version: warning echoed, plan computed - #
+    bad_req = base_request()
+    bad_req["concentrates"][0]["available_volume"] = 50
+    r = client.post("/api/recipes?force=true",
+                    json={"name": "bad-procurement", "request": bad_req})
+    assert r.status_code == 201
+    bp_rid = r.json()["recipe_id"]
+    d = client.post(
+        f"/api/recipes/{bp_rid}/versions/1/procurement-plan",
+        json=pc_body(stock=[
+            {"concentrate": "A液", "stock_ml": 100000},
+            {"concentrate": "B液", "stock_ml": 100000}])).json()
+    assert d["recipe_feasible"] is False
+    assert d["warning"] and "不可行" in d["warning"]
+    assert d["feasible"] is True
+    print("51) infeasible version procurement carries warning")
+
+    # 52) brute-force oracle over random small instances ------------------ #
+    import itertools
+    import random
+    one_liq_recipe = {
+        "target_volume_ml": 1000,
+        "targets": {"concentrations": {"N": 50}},
+        "concentrates": [
+            {"name": "X", "available_volume": 1000,
+             "concentrations": {"N": 500}}],
+        "max_concentrate_fraction": 1.0, "min_water_ml": 0,
+        "tolerance": 0.05,
+    }
+    r = client.post("/api/recipes", json={
+        "name": "采购暴力枚举", "request": one_liq_recipe})
+    assert r.status_code == 201
+    x_rid = r.json()["recipe_id"]
+    x_url = f"/api/recipes/{x_rid}/versions/1/procurement-plan"
+
+    def brute_one(needs, qs, init):
+        """Enumerate optimum (cost, packs); None if infeasible.
+
+        Returns ``(best, optimal_combos)`` where ``optimal_combos`` lists
+        every quote-count vector attaining the minimum cost and, within
+        that, the minimum package total (spec tie-break), since different
+        same-price/same-size quotes are interchangeable.
+        """
+        doms = [range((cap if cap is not None else 6) + 1)
+                for _, _, _, cap in qs]
+        best = None
+        allbest: list[tuple] = []
+        for combo in itertools.product(*doms):
+            level, ok = init, True
+            for t, need in enumerate(needs):
+                for j, (size, _, cut, _cap) in enumerate(qs):
+                    if cut == t:
+                        level += size * combo[j]
+                level -= need
+                if level < -1e-7:
+                    ok = False
+                    break
+            if not ok:
+                continue
+            cost = sum(price * combo[j]
+                       for j, (_, price, _, _) in enumerate(qs))
+            cand = (cost, sum(combo), tuple(combo))
+            if best is None or cand[:2] < best[:2]:
+                best = cand
+                allbest = [cand]
+            elif cand[:2] == best[:2]:
+                allbest.append(cand)
+        return best, [b[2] for b in allbest]
+
+    rng = random.Random(42)
+    checked = 0
+    for _ in range(400):
+        days = rng.randint(1, 3)
+        water = rng.choice([50, 100, 150, 200])
+        init = rng.choice([0, 50, 100])
+        qs = []
+        payload_quotes = []
+        for _j in range(rng.randint(0, 3)):
+            size = rng.choice([25, 50, 75, 100, 125])
+            price = rng.choice([5, 10, 15, 20])
+            cut = rng.randint(0, days)  # days == arrives after last batch
+            cap = rng.choice([None, 0, 1, 2, 3])
+            qs.append((size, price, cut, cap))
+            payload_quotes.append({
+                "concentrate": "X", "package_ml": size, "price": price,
+                "arrival_date": f"2026-05-{1 + cut:02d}",
+                "max_packages": cap})
+        body = {
+            "timezone": "UTC",
+            "start_date": "2026-05-01",
+            "end_date": f"2026-05-{days:02d}",
+            "sessions": [{"start_time": "12:00", "duration_minutes": 5,
+                          "water_ml": water}],
+            "stock": [{"concentrate": "X", "stock_ml": init}],
+            "quotes": payload_quotes,
+        }
+        d = client.post(x_url, json=body).json()
+        needs = [0.1 * water] * days
+        exp, alt = brute_one(needs, qs, init)
+        if exp is None:
+            assert d["feasible"] is False, (checked, d)
+            assert d["first_shortfall"] is not None
+        else:
+            assert d["feasible"] is True, (checked, d)
+            assert abs(d["total_cost"] - exp[0]) < 1e-6, (
+                checked, d["total_cost"], exp)
+            assert d["total_packages"] == exp[1], (
+                checked, d["total_packages"], exp)
+            assert tuple(q["packages"] for q in d["quotes"]) in alt
+        checked += 1
+    print(f"52) procurement brute-force oracle matched on {checked} instances")
+
 print("\nALL SMOKE TESTS PASSED")

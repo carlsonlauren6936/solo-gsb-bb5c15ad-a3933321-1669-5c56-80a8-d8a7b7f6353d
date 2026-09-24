@@ -23,6 +23,8 @@ from .models import (
     DispensePlanResult,
     IrrigationPlanRequest,
     IrrigationPlanResult,
+    ProcurementPlanRequest,
+    ProcurementPlanResult,
     RecipeSummary,
     RecipeVersion,
     SaveRecipeRequest,
@@ -30,6 +32,7 @@ from .models import (
     SolveResult,
     VersionSummary,
 )
+from .procurement import ProcurementError, build_procurement_plan
 from .solver import solve
 
 
@@ -264,6 +267,75 @@ def consumption_forecast(
     except ForecastError as exc:
         raise HTTPException(status_code=422, detail={"message": str(exc)})
     return ConsumptionForecastResult(**forecast)
+
+
+@app.post(
+    "/api/recipes/{recipe_id}/versions/{version}/procurement-plan",
+    response_model=ProcurementPlanResult,
+    tags=["recipes"],
+    summary="整包补货采购：按灌溉批次求最低总价的整包采购组合",
+)
+def procurement_plan(
+    recipe_id: int, version: int, req: ProcurementPlanRequest
+) -> ProcurementPlanResult:
+    """读取指定配方版本的求解结果，按实际灌溉批次求整包补货采购组合。
+
+    - 复用灌溉批次展开（DST/跨午夜/合并/停灌）与版本求解结果：每批用液
+      需求 = 版本分配体积 ÷ 目标总体积 × **该批次实际（合并后）水量**；
+      跨午夜批次在其本地开始时刻只扣一次。
+    - 每个报价按**整包**出售（``package_ml`` mL/包、单价 ``price``、
+      到货本地日期 ``arrival_date``、最多可购 ``max_packages`` 包）：
+      到货在该日本地**首个批次前**入库，当日（含本地 00:00）批次均可使用。
+    - 目标：在每批扣减后各浓缩液库存均非负的前提下，求**最低总价**的
+      非负整数包数组合；总价相同时取**总包数最少**（整数线性规划，
+      HiGHS，两阶段求解）。
+    - 报价时点过晚或供应上限使目标无解时返回 200 且 ``feasible=false``，
+      **不伪造采购单**（``quotes[].packages`` 全为 null），并在
+      ``first_shortfall`` 给出最早出现缺口的批次及该批缺口的浓缩液
+      （需求/可达供给/缺口）。
+    - 配方/版本不存在返回 404；库存或报价名称与版本不匹配、重复/缺失
+      库存、非正或非有限的整包容量/价格、到货日期或灌溉计划参数非法、
+      多余字段均返回 422。
+    """
+    recipe = database.get_recipe(recipe_id)
+    if recipe is None:
+        raise HTTPException(404, "配方不存在")
+    row = database.get_version(recipe_id, version)
+    if row is None:
+        raise HTTPException(404, "该版本不存在")
+
+    result_payload = json.loads(row["result_json"])
+    stock = {s.concentrate: s.stock_ml for s in req.stock}
+    quotes = [
+        {
+            "concentrate": q.concentrate,
+            "package_ml": q.package_ml,
+            "price": q.price,
+            "arrival_date": q.arrival_date,
+            "max_packages": q.max_packages,
+        }
+        for q in req.quotes
+    ]
+    try:
+        plan = build_procurement_plan(
+            recipe_id=recipe_id,
+            version=version,
+            solve_result=result_payload,
+            tz=ZoneInfo(req.timezone),
+            start_date=req.start_date,
+            end_date=req.end_date,
+            sessions=[
+                (s.start_time, s.start_time.strftime("%H:%M:%S"),
+                 s.duration_minutes, s.water_ml)
+                for s in req.sessions
+            ],
+            stock=stock,
+            quotes=quotes,
+            suspended_dates=set(req.suspended_dates),
+        )
+    except ProcurementError as exc:
+        raise HTTPException(status_code=422, detail={"message": str(exc)})
+    return ProcurementPlanResult(**plan)
 
 
 @app.post(

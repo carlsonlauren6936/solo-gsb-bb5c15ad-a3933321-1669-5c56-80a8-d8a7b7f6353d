@@ -544,6 +544,269 @@ class ConsumptionForecastResult(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Whole-package replenishment procurement planning
+# --------------------------------------------------------------------------- #
+class QuoteInput(BaseModel):
+    """One supplier quote: concentrate sold in fixed whole packages."""
+
+    concentrate: str = Field(
+        ..., min_length=1, description="报价对应的浓缩液名称（须与配方版本一致）"
+    )
+    package_ml: float = Field(
+        ...,
+        gt=0,
+        strict=True,
+        description=(
+            "整包装容量 (mL/包)，必须为有限正数（数字，不接受 \"1000\" 这类"
+            "数字字符串）；采购量只能是该容量的非负整数倍"
+        ),
+    )
+    price: float = Field(
+        ...,
+        gt=0,
+        strict=True,
+        description="整包单价（同一货币单位），必须为有限正数（数字）",
+    )
+    arrival_date: date = Field(
+        ...,
+        description=(
+            "到货本地日期（按 timezone 解释）；该货物在当日**首个批次前**入库，"
+            "当日全部批次（含本地 00:00 开始的批次）都可使用"
+        ),
+    )
+    max_packages: Optional[int] = Field(
+        None,
+        ge=0,
+        description="最多可购包数（非负整数）；缺省（null）表示不限量",
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("package_ml", "price")
+    @classmethod
+    def _finite_positive(cls, v: float) -> float:
+        # gt rejects <= 0, but NaN slips through comparisons; reject NaN/Inf
+        # explicitly as illegal quotes.
+        if v != v or v in (float("inf"), float("-inf")):
+            raise ValueError("必须为有限正数")
+        return float(v)
+
+
+class ProcurementPlanRequest(IrrigationScheduleBase):
+    """Irrigation schedule + current stock + supplier quotes for a version."""
+
+    stock: list[StockLevel] = Field(
+        ..., min_length=1, description="各浓缩液当前库存；名称须与配方求解结果一一对应"
+    )
+    quotes: list[QuoteInput] = Field(
+        default_factory=list,
+        description=(
+            "补货报价列表（可为空：库存本身已足够时返回全 0 采购）；"
+            "同一浓缩液可有多个报价，按整包出售、按到货日入库"
+        ),
+    )
+
+    @field_validator("stock")
+    @classmethod
+    def _unique_stock(cls, v: list[StockLevel]) -> list[StockLevel]:
+        names = [s.concentrate for s in v]
+        if len(names) != len(set(names)):
+            raise ValueError("库存浓缩液名称不能重复")
+        return v
+
+
+class ProcurementQuoteResult(BaseModel):
+    """Purchased package count of one quote in the chosen procurement plan."""
+
+    index: int = Field(..., description="报价序号，从 1 起（按请求顺序）")
+    concentrate: str
+    package_ml: float = Field(..., description="整包装容量 (mL/包)")
+    price: float = Field(..., description="整包单价")
+    arrival_date: str = Field(..., description="到货本地日期")
+    max_packages: Optional[int] = Field(
+        ..., description="最多可购包数；不限量为 null"
+    )
+    packages: Optional[int] = Field(
+        ...,
+        description=(
+            "本报价采购包数（非负整数）；整体无解时不生成采购单，恒为 null"
+        ),
+    )
+    volume_ml: Optional[float] = Field(
+        ..., description="本报价补货体积 = package_ml × packages；无解时为 null"
+    )
+    cost: Optional[float] = Field(
+        ..., description="本报价金额 = price × packages；无解时为 null"
+    )
+
+
+class ProcurementInbound(BaseModel):
+    """One quote's packages entering stock at one batch."""
+
+    quote_index: int
+    concentrate: str
+    packages: int
+    volume_ml: float
+
+
+class ProcurementBatchLiquid(BaseModel):
+    """One concentrate's demand / post-deduction level at one batch."""
+
+    concentrate: str
+    required_ml: float = Field(
+        ..., description="按批次实际水量折算的本批用液需求 (mL)"
+    )
+    remaining_ml: float = Field(
+        ...,
+        description="本批扣减（并完成本批到货入库）后的库存 (mL)，恒 ≥ 0",
+    )
+
+
+class ProcurementGapLiquid(BaseModel):
+    """One concentrate shortfall inside the first un-coverable batch."""
+
+    concentrate: str
+    required_ml: float
+    available_ml: float = Field(
+        ...,
+        description=(
+            "即使把各报价买到上限，本批扣减前可用的该浓缩液库存 (mL)"
+        ),
+    )
+    shortfall_ml: float = Field(..., description="本批缺口 = required - available")
+
+
+class ProcurementShortfall(BaseModel):
+    """Earliest batch that cannot be covered even when buying at every cap."""
+
+    batch_index: int = Field(..., description="最早出现缺口的批次序号（从 1 起）")
+    start_utc: str
+    local_start: str
+    local_end: str
+    attributed_date: str
+    water_ml: float
+    liquids: list[ProcurementGapLiquid] = Field(
+        ...,
+        description=(
+            "该批次发生缺口的浓缩液及各自需求/可供给量/缺口（同批多个浓缩液"
+            "同时不足时全部列出）"
+        ),
+    )
+    message: str
+
+
+class ProcurementBatch(BaseModel):
+    """One actual (post-merge) batch with arrivals, demand and stock levels."""
+
+    index: int
+    start_utc: str
+    local_start: str
+    local_end: str
+    attributed_date: str = Field(
+        ...,
+        description=(
+            "归属本地日：取批次本地开始日；跨午夜/合并批次整体只在该日扣一次"
+        ),
+    )
+    water_ml: float = Field(..., description="合并后批次实际水量，用液需求据此折算")
+    merged: bool
+    batch_count_before_merge: int
+    crosses_midnight: bool
+    inbound: list[ProcurementInbound] = Field(
+        default_factory=list,
+        description=(
+            "本批开始前入库的整包（仅到货日本地首个批次携带，避免重复登记）；"
+            "到货早于计划起始日的报价计入各液期初可用量"
+        ),
+    )
+    liquids: list[ProcurementBatchLiquid]
+    sufficient: bool = Field(
+        ...,
+        description=(
+            "把各报价买到上限时本批扣减后库存是否非负；仅在整体无解的"
+            "诊断轨迹中可能为 false"
+        ),
+    )
+
+
+class ProcurementLiquidSummary(BaseModel):
+    concentrate: str
+    initial_stock_ml: float = Field(
+        ..., description="请求中的当前库存 (mL)"
+    )
+    initial_available_ml: float = Field(
+        ...,
+        description=(
+            "首个批次前的期初可用量 = 当前库存 + 到货日早于计划起始日的"
+            "报价采购量（无解时按买到上限计）"
+        ),
+    )
+    mix_ml_per_l: float
+    total_required_ml: float
+    purchased_ml: Optional[float] = Field(
+        ...,
+        description=(
+            "该浓缩液各报价补货体积合计；无解时为 null（不伪造采购量）"
+        ),
+    )
+    capped_supply_ml: Optional[float] = Field(
+        None,
+        description=(
+            "无解诊断：所有**有限上限**报价买到上限时该浓缩液的可达供货量"
+            "（不含不限量报价）；可求解时为 null"
+        ),
+    )
+    final_remaining_ml: Optional[float] = Field(
+        ...,
+        description="最末批次扣减后的剩余库存；无解时为 null"
+    )
+
+
+class ProcurementPlanResult(BaseModel):
+    recipe_id: int
+    version: int
+    recipe_feasible: bool = Field(
+        ..., description="对应配方版本求解结果是否在容差内可行"
+    )
+    warning: Optional[str] = Field(
+        None, description="配方版本不可行时的提示；可行时为 null"
+    )
+    timezone: str
+    start_date: str
+    end_date: str
+    days: int
+    suspended_dates: list[str] = Field(default_factory=list)
+    batch_count_before_merge: int
+    batch_count_after_merge: int
+    planned_water_ml: float
+    feasible: bool = Field(
+        ...,
+        description=(
+            "是否存在使每批扣减后各浓缩液库存均非负的整包采购组合；"
+            "false 时不返回任何采购包数，缺口见 first_shortfall"
+        ),
+    )
+    total_cost: Optional[float] = Field(
+        ..., description="最低总价；无解时为 null"
+    )
+    total_packages: Optional[int] = Field(
+        ...,
+        description="最优方案总包数（同价时取总包数最少）；无解时为 null",
+    )
+    quotes: list[ProcurementQuoteResult]
+    liquids: list[ProcurementLiquidSummary]
+    batches: list[ProcurementBatch]
+    first_shortfall: Optional[ProcurementShortfall] = Field(
+        None,
+        description=(
+            "报价时点或供应上限导致无解时，最早出现缺口的批次与浓缩液；"
+            "可求解时为 null"
+        ),
+    )
+    message: str = ""
+
+
+# --------------------------------------------------------------------------- #
 # Integer pump-stroke dispense planning
 # --------------------------------------------------------------------------- #
 class PumpDoseInput(BaseModel):
