@@ -53,6 +53,7 @@ DATABASE_PATH=./hydroponic.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/recipes/{id}/versions/{v}/export` | **导出该版本 JSON 文件** |
 | POST | `/api/recipes/{id}/versions/{v}/dispense-plan` | **整数泵送投料方案**：按各浓缩液单次泵送量（mL）求整数泵次，最小化各元素最大相对偏差 |
 | POST | `/api/recipes/{id}/versions/{v}/consumption-forecast` | **库存消耗预测**：按灌溉计划逐批次等比例扣减浓缩液，输出每日消耗/剩余与首个不足日期（支持 `suspended_dates` 本地停灌日） |
+| POST | `/api/recipes/{id}/versions/{v}/procurement-plan` | **补货采购方案**：给定当前库存与整包报价，求每批扣减后库存非负的最低总价整包采购组合（同价取总包数最少） |
 | POST | `/api/irrigation/plan` | **灌溉计划**：按 IANA 时区生成逐日执行批次（DST/跨午夜/容量校验/本地停灌日） |
 | GET | `/health` | 健康检查 |
 
@@ -668,19 +669,205 @@ curl -s -X POST \
 - **404**：配方不存在、或该配方下版本不存在（如 `/api/recipes/1/versions/99/...`）；
 - **422**：库存名称未知（`未知浓缩液：C液`）、缺少某液（`库存缺少…浓缩液`）、库存为负或名称重复；以及灌溉计划参数的全部校验失败（非法时区/日期、空或重复时段、非正时长/水量、`suspended_dates` 重复或超出日期范围、多余字段）。
 
+## 补货采购（POST /api/recipes/{id}/versions/{v}/procurement-plan）
+
+给定已保存的**配方版本**、一套灌溉计划参数与各浓缩液**当前库存**，再给出若干供应商**整包报价**（浓缩液、整包装容量 mL、每包价格、到货**本地日期**、最多可购包数），服务复用灌溉批次展开与版本求解结果（`allocations` / `total_volume_ml`），规划一次整包补货采购：
+
+- **按批次实际水量折算用液需求**：每批某浓缩液需求 = 版本分配体积 ÷ 目标总体积 × **合并后实际批次水量**；相邻 ≤ 1 分钟批次已合并、DST 跳变已处理；
+- **跨午夜批次按开始时刻扣一次**：每个合并后批次整体只在其**开始时刻**扣减一次（归属本地开始日），跨入次日不重复扣；
+- **到货入库时点**：到货日本地**首个批次之前**入库——报价只能服务**本地开始日期不早于到货日**的批次；到货日没有批次（如停灌日）时顺延到下一批次入库；
+- **整包采购**：每报价采购包数为 `0..max_packs` 的非负整数。
+
+目标分两阶段（HiGHS 整数线性规划）：
+
+1. **最低总价**：在「每批扣减后库存非负」约束下最小化 `Σ 采购包数 × 每包价格`；
+2. **同价取总包数最少**：在所有最低总价方案中最小化总包数（确定性、动作更少的选择）。
+
+### 请求
+
+```bash
+curl -s -X POST \
+  http://localhost:8000/api/recipes/1/versions/1/procurement-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "timezone": "Asia/Shanghai",
+    "start_date": "2026-05-01",
+    "end_date": "2026-05-03",
+    "sessions": [
+      {"start_time": "08:00",     "duration_minutes": 10, "water_ml": 500},
+      {"start_time": "08:10:30",  "duration_minutes": 5,  "water_ml": 200},
+      {"start_time": "23:55",     "duration_minutes": 10, "water_ml": 300}
+    ],
+    "stock": [
+      {"concentrate": "A液", "stock_ml": 100},
+      {"concentrate": "B液", "stock_ml": 10}
+    ],
+    "quotes": [
+      {"concentrate": "A液", "pack_size_ml": 200, "price": 10,
+       "arrival_date": "2026-05-01", "max_packs": 5},
+      {"concentrate": "B液", "pack_size_ml": 50,  "price": 8,
+       "arrival_date": "2026-05-01", "max_packs": 5}
+    ]
+  }'
+```
+
+计划参数（`timezone` / `start_date` / `end_date` / `sessions` / `suspended_dates`）的含义与校验规则与 [灌溉计划](#灌溉计划post-apirrigationplan) 完全一致。`stock` 与 [库存消耗预测](#库存消耗预测post-apiridversionsvconsumption-forecast) 相同：名称必须与版本 `allocations[].concentrate` 一一对应、非负、不重复。`quotes` 字段：
+
+| 字段 | 说明 |
+| ---- | ---- |
+| `concentrate` | 浓缩液名称，必须属于该版本（未知返回 422） |
+| `pack_size_ml` | **整包装容量** (mL)，必须为有限正数 |
+| `price` | **每包价格**，必须为有限正数 |
+| `arrival_date` | **到货本地日期**（`YYYY-MM-DD`，按 `timezone` 解释）；必须落在 `start_date~end_date` 内，否则 422；当日本地首个批次之前入库 |
+| `max_packs` | **最多可购包数**，正整数；采购包数 ∈ `[0, max_packs]` |
+
+`quotes` 允许为空（仅当现有库存即可全程满足时有解）。同一浓缩液可给多条报价（不同容量/价格/到货日自由竞争），允许重复。
+
+### 响应（可行时）
+
+上例 3 天共 3000 mL 水，需 A 450 mL、B 37.5 mL；库存 100/10，故还需 A 350 mL（→ 2×200 mL）、B 27.5 mL（→ 1×50 mL），总价 28：
+
+```json
+{
+  "recipe_id": 1,
+  "version": 1,
+  "recipe_feasible": true,
+  "warning": null,
+  "feasible": true,
+  "optimal": true,
+  "timezone": "Asia/Shanghai",
+  "start_date": "2026-05-01",
+  "end_date": "2026-05-03",
+  "days": 3,
+  "suspended_dates": [],
+  "batch_count_before_merge": 9,
+  "batch_count_after_merge": 6,
+  "planned_water_ml": 3000.0,
+  "quotes": [
+    {"index": 1, "concentrate": "A液", "pack_size_ml": 200.0, "price": 10.0,
+     "arrival_date": "2026-05-01", "max_packs": 5,
+     "packs": 2, "volume_ml": 400.0, "cost": 20.0},
+    {"index": 2, "concentrate": "B液", "pack_size_ml": 50.0, "price": 8.0,
+     "arrival_date": "2026-05-01", "max_packs": 5,
+     "packs": 1, "volume_ml": 50.0, "cost": 8.0}
+  ],
+  "total_packs": 3,
+  "total_price": 28.0,
+  "liquids": [
+    {"concentrate": "A液", "initial_stock_ml": 100.0, "mix_ml_per_l": 150.0,
+     "total_required_ml": 450.0, "total_purchased_ml": 400.0,
+     "final_remaining_ml": 50.0},
+    {"concentrate": "B液", "initial_stock_ml": 10.0, "mix_ml_per_l": 12.5,
+     "total_required_ml": 37.5, "total_purchased_ml": 50.0,
+     "final_remaining_ml": 22.5}
+  ],
+  "batches": [
+    {
+      "index": 1,
+      "start_utc": "2026-05-01T00:00:00Z",
+      "local_start": "2026-05-01T08:00:00+0800",
+      "local_end": "2026-05-01T08:15:30+0800",
+      "attributed_date": "2026-05-01",
+      "water_ml": 700.0,
+      "merged": true,
+      "batch_count_before_merge": 2,
+      "crosses_midnight": false,
+      "inbound": [
+        {"concentrate": "A液", "packs": 2, "volume_ml": 400.0},
+        {"concentrate": "B液", "packs": 1, "volume_ml": 50.0}
+      ],
+      "liquids": [
+        {"concentrate": "A液", "required_ml": 105.0,
+         "beginning_ml": 500.0, "remaining_ml": 395.0},
+        {"concentrate": "B液", "required_ml": 8.75,
+         "beginning_ml": 60.0, "remaining_ml": 51.25}
+      ]
+    },
+    {
+      "index": 2,
+      "start_utc": "2026-05-01T15:55:00Z",
+      "local_start": "2026-05-01T23:55:00+0800",
+      "local_end": "2026-05-02T00:05:00+0800",
+      "attributed_date": "2026-05-01",
+      "water_ml": 300.0,
+      "merged": false,
+      "batch_count_before_merge": 1,
+      "crosses_midnight": true,
+      "inbound": [],
+      "liquids": [/* 跨午夜批次仍只在开始时刻（05-01）扣减一次 */]
+    }
+  ],
+  "first_gap": null,
+  "message": "采购方案求解成功：共采购 3 包，总价 28；各批次扣减后库存均非负。"
+}
+```
+
+字段要点：
+
+- `quotes[]` 按请求顺序回显，`index` 从 1 起；`packs` 为采购包数，`volume_ml = pack_size_ml × packs`、`cost = price × packs`；顶层 `total_packs` / `total_price` 为合计。
+- `batches[].inbound` 只在到货日的**首个批次**上列出入库采购量（同日后续批次为空）；`liquids[].beginning_ml` 已含当批之前（含当批）入库量，`remaining_ml` 为扣减后库存，**始终 ≥ 0**。
+- 跨午夜批次 `attributed_date` 取本地开始日，需求按开始时刻只扣一次；合并批次按合并后总水量折算。
+- 停灌语义与预测一致：停灌日不排定批次，到货落在停灌日则顺延到下一实际批次入库；前一日开始跨入停灌日的批次仍归属前一日、照常扣减。
+
+### 无解时：返回最早缺口，不伪造采购单
+
+当报价的**到货时点**（货赶不上批次）或**供应上限**（`max_packs` 太少）使「全程库存非负」无解时，服务先做最大供给检查（每条报价按上限买满、按到货时间入库），定位**最早出现缺口的批次**，并返回 HTTP 200、`"feasible": false`：
+
+- `quotes[].packs` **全为 0**、`total_packs/total_price` 为 0、`batches` 为空——**不输出任何不可执行的采购单**；
+- `first_gap` 给出最早缺口批次（序号、UTC/本地时间、归属日、水量、是否合并/跨午夜）与逐液 `required_ml`（该批需求）、`available_ml`（按上限买满时该批扣减前可用量）、`shortfall_ml`（缺口）。
+
+例如 A 液库存 100 mL，唯一报价 200 mL/包但 `2026-05-02` 才到货：首个批次（05-01 08:00，700 mL 需 A 105 mL）即缺 5 mL：
+
+```json
+{
+  "feasible": false,
+  "optimal": false,
+  "quotes": [/* packs 全为 0 */],
+  "total_packs": 0,
+  "total_price": 0.0,
+  "batches": [],
+  "first_gap": {
+    "index": 1,
+    "start_utc": "2026-05-01T00:00:00Z",
+    "local_start": "2026-05-01T08:00:00+0800",
+    "local_end": "2026-05-01T08:15:30+0800",
+    "attributed_date": "2026-05-01",
+    "water_ml": 700.0,
+    "merged": true,
+    "batch_count_before_merge": 2,
+    "crosses_midnight": false,
+    "liquids": [
+      {"concentrate": "A液", "required_ml": 105.0,
+       "available_ml": 100.0, "shortfall_ml": 5.0},
+      {"concentrate": "B液", "required_ml": 8.75,
+       "available_ml": 60.0, "shortfall_ml": 0.0}
+    ],
+    "message": "最早缺口出现在第 1 批（本地 2026-05-01T08:00:00+0800 开始）：浓缩液 A液 在该批扣减后库存将为负；现有报价的到货时点或最多可购包数无法补足缺口，未生成可执行采购单。"
+  }
+}
+```
+
+> 注意整包取整：采购可以买多（剩余库存允许为正），但不能买半包；因此「够不够」按整包累计体积判定。通过 `?force=true` 保存的不可行版本也可规划：返回 `recipe_feasible=false` 与 `warning`，需求按其折中方案 `allocations` 折算，结果仅供参考。
+
+错误码：
+
+- **404**：配方不存在、或该配方下版本不存在；
+- **422**：库存/报价浓缩液名称与版本不匹配（未知/缺少/重复）、库存为负、`pack_size_ml` 或 `price` 非正或非有限值（`0`、负数、`NaN`、`Infinity`、数字字符串 `"200"`）、`max_packs` 非正整数、`arrival_date` 超出 `start_date~end_date` 或格式非法（**无效日期返回 422**）、`quotes`/`stock` 多余字段，以及灌溉计划参数的全部校验失败（非法时区/日期、空或重复时段、非正时长/水量、`suspended_dates` 重复或超出范围）。
+
 ## 项目结构
 
 ```
 .
 ├── app/
-│   ├── main.py       # FastAPI 路由（试算 / 保存 / 版本 / 导出 / 整数泵送 / 灌溉计划 / 消耗预测）
-│   ├── solver.py     # minimax LP 建模与无可行解诊断
-│   ├── dispense.py   # 整数泵送方案：MILP（HiGHS）求整数泵次、最小化最大相对偏差
-│   ├── irrigation.py # 灌溉批次生成：时区/DST 解析、跨午夜、合并、容量校验
-│   ├── forecast.py   # 库存消耗预测：按实际批次等比例扣减、缺口标记、逐日汇总
-│   ├── models.py     # Pydantic 请求/响应模型
-│   ├── database.py   # SQLite 初始化与配方/版本存取
-│   └── config.py     # 元素清单、默认容差、DB 路径
+│   ├── main.py        # FastAPI 路由（试算 / 保存 / 版本 / 导出 / 整数泵送 / 灌溉计划 / 消耗预测 / 补货采购）
+│   ├── solver.py      # minimax LP 建模与无可行解诊断
+│   ├── dispense.py    # 整数泵送方案：MILP（HiGHS）求整数泵次、最小化最大相对偏差
+│   ├── irrigation.py  # 灌溉批次生成：时区/DST 解析、跨午夜、合并、容量校验
+│   ├── forecast.py    # 库存消耗预测：按实际批次等比例扣减、缺口标记、逐日汇总
+│   ├── procurement.py # 补货采购：整包整数 MILP（最低总价、同价最少包数）、最早缺口定位
+│   ├── models.py      # Pydantic 请求/响应模型
+│   ├── database.py    # SQLite 初始化与配方/版本存取
+│   └── config.py      # 元素清单、默认容差、DB 路径
 ├── Dockerfile
 ├── docker-compose.yml
 ├── smoke_test.py     # TestClient 端到端冒烟测试（含整数方案的暴力枚举对照）

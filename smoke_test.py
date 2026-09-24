@@ -1089,4 +1089,286 @@ with TestClient(app) as client:
     assert "缺少" in rr.json()["detail"]["message"]
     print("43) dispense-plan 404/422 cases all ok")
 
+    # =================================================================== #
+    # Replenishment procurement plan
+    # (POST /api/recipes/{id}/versions/{v}/procurement-plan)
+    # =================================================================== #
+    # Same A/B chemistry: per litre of irrigation water A 0.15 mL,
+    # B 0.0125 mL. 3 days x 1000 mL -> A 450 mL, B 37.5 mL required.
+    r = client.post("/api/recipes", json={
+        "name": "采购配方", "note": "v1", "request": base_request()})
+    assert r.status_code == 201, r.text
+    pr_rid = r.json()["recipe_id"]
+    pr_url = f"/api/recipes/{pr_rid}/versions/1/procurement-plan"
+
+    def pr_body(**overrides) -> dict:
+        b = {
+            "timezone": "Asia/Shanghai",
+            "start_date": "2026-05-01",
+            "end_date": "2026-05-03",
+            "sessions": [
+                {"start_time": "08:00", "duration_minutes": 10,
+                 "water_ml": 500},
+                {"start_time": "08:10:30", "duration_minutes": 5,
+                 "water_ml": 200},   # merges with 08:00 -> 700 mL
+                {"start_time": "23:55", "duration_minutes": 10,
+                 "water_ml": 300},   # crosses midnight, deducted once
+            ],
+            "stock": [
+                {"concentrate": "A液", "stock_ml": 100},
+                {"concentrate": "B液", "stock_ml": 10},
+            ],
+            "quotes": [
+                {"concentrate": "A液", "pack_size_ml": 200, "price": 10,
+                 "arrival_date": "2026-05-01", "max_packs": 5},
+                {"concentrate": "B液", "pack_size_ml": 50, "price": 8,
+                 "arrival_date": "2026-05-01", "max_packs": 5},
+            ],
+        }
+        b.update(overrides)
+        return b
+
+    # 44) cheapest feasible whole-pack plan; inbound before first batch -- #
+    d = client.post(pr_url, json=pr_body()).json()
+    assert d["feasible"] is True and d["optimal"] is True, d
+    # A needs 350 more -> 2x200 = 400 mL @20; B needs 27.5 -> 1x50 @8
+    q = {(x["concentrate"], x["pack_size_ml"]): x for x in d["quotes"]}
+    assert q[("A液", 200)]["packs"] == 2
+    assert q[("B液", 50)]["packs"] == 1
+    assert d["total_packs"] == 3 and d["total_price"] == 28
+    # every post-deduction stock is non-negative
+    for b in d["batches"]:
+        assert b["attributed_date"] == b["local_start"][:10]
+        for l in b["liquids"]:
+            assert l["remaining_ml"] >= -1e-9, (b["index"], l)
+    # arrivals are inbound only before the day's FIRST batch
+    day1 = [b for b in d["batches"] if b["attributed_date"] == "2026-05-01"]
+    assert len(day1) == 2
+    assert {x["concentrate"] for x in day1[0]["inbound"]} == {"A液", "B液"}
+    assert day1[1]["inbound"] == []
+    la = {x["concentrate"]: x for x in day1[0]["liquids"]}
+    assert abs(la["A液"]["required_ml"] - 105) < 1e-9       # 0.15 * 700
+    assert abs(la["A液"]["beginning_ml"] - 500) < 1e-6      # 100 + 400
+    assert abs(la["A液"]["remaining_ml"] - 395) < 1e-6
+    assert abs(la["B液"]["beginning_ml"] - 60) < 1e-6       # 10 + 50
+    assert abs(la["B液"]["remaining_ml"] - 51.25) < 1e-6
+    # cross-midnight batch deducted once, attributed to its start day
+    xb = [b for b in d["batches"] if b["crosses_midnight"]]
+    assert len(xb) == 3 and all(
+        b["attributed_date"] == b["local_start"][:10] for b in xb)
+    # summary rows
+    ls = {x["concentrate"]: x for x in d["liquids"]}
+    assert abs(ls["A液"]["total_required_ml"] - 450) < 1e-6
+    assert abs(ls["A液"]["total_purchased_ml"] - 400) < 1e-6
+    assert abs(ls["A液"]["final_remaining_ml"] - 50) < 1e-6
+    assert abs(ls["B液"]["total_required_ml"] - 37.5) < 1e-6
+    assert abs(ls["B液"]["final_remaining_ml"] - 22.5) < 1e-6
+    print("44) procurement: cheapest whole-pack plan, inbound/once-only OK")
+
+    # 45) min total price across quotes; same price -> fewer total packs -- #
+    # 100mL@5 (4 packs = 20) vs 200mL@9.8 (2 packs = 19.6): choose cheaper
+    d = client.post(pr_url, json=pr_body(quotes=[
+        {"concentrate": "A液", "pack_size_ml": 100, "price": 5,
+         "arrival_date": "2026-05-01", "max_packs": 5},
+        {"concentrate": "A液", "pack_size_ml": 200, "price": 9.8,
+         "arrival_date": "2026-05-01", "max_packs": 5},
+        {"concentrate": "B液", "pack_size_ml": 50, "price": 8,
+         "arrival_date": "2026-05-01", "max_packs": 5}])).json()
+    assert d["feasible"] is True
+    q = {(x["concentrate"], x["pack_size_ml"]): x for x in d["quotes"]}
+    assert q[("A液", 100)]["packs"] == 0 and q[("A液", 200)]["packs"] == 2
+    assert abs(d["total_price"] - 27.6) < 1e-6
+    # exact same total price (4x100 @5 == 2x200 @10 == 20): fewer packs wins
+    d = client.post(pr_url, json=pr_body(quotes=[
+        {"concentrate": "A液", "pack_size_ml": 100, "price": 5,
+         "arrival_date": "2026-05-01", "max_packs": 5},
+        {"concentrate": "A液", "pack_size_ml": 200, "price": 10,
+         "arrival_date": "2026-05-01", "max_packs": 5},
+        {"concentrate": "B液", "pack_size_ml": 50, "price": 8,
+         "arrival_date": "2026-05-01", "max_packs": 5}])).json()
+    q = {(x["concentrate"], x["pack_size_ml"]): x for x in d["quotes"]}
+    assert q[("A液", 100)]["packs"] == 0 and q[("A液", 200)]["packs"] == 2
+    assert d["total_packs"] == 3 and d["total_price"] == 28
+    print("45) procurement: min price, tie -> min total packs")
+
+    # 46) timing infeasibility: late arrival cannot serve batch 1 -------- #
+    d = client.post(pr_url, json=pr_body(quotes=[
+        {"concentrate": "A液", "pack_size_ml": 200, "price": 10,
+         "arrival_date": "2026-05-02", "max_packs": 5},
+        {"concentrate": "B液", "pack_size_ml": 50, "price": 8,
+         "arrival_date": "2026-05-01", "max_packs": 5}])).json()
+    assert d["feasible"] is False and d["optimal"] is False
+    g = d["first_gap"]
+    assert g["index"] == 1 and g["attributed_date"] == "2026-05-01"
+    short = {l["concentrate"]: l for l in g["liquids"]
+             if l["shortfall_ml"] > 0}
+    assert set(short) == {"A液"}
+    assert abs(short["A液"]["required_ml"] - 105) < 1e-6
+    assert abs(short["A液"]["available_ml"] - 100) < 1e-6
+    assert abs(short["A液"]["shortfall_ml"] - 5) < 1e-6
+    # never fabricate an executable order: zero packs / price, no batches
+    assert all(x["packs"] == 0 for x in d["quotes"])
+    assert d["total_packs"] == 0 and d["total_price"] == 0
+    assert d["batches"] == [] and d["first_gap"] is not None
+    print("46) procurement: timing gap -> earliest batch, no fake order")
+
+    # 47) supply-cap infeasibility: earliest gap comes later ------------- #
+    # A max supply 100 + 200 = 300: covers day1+day2 (cum 300 exactly),
+    # first gap at first batch of day3 (index 5)
+    d = client.post(pr_url, json=pr_body(quotes=[
+        {"concentrate": "A液", "pack_size_ml": 200, "price": 10,
+         "arrival_date": "2026-05-01", "max_packs": 1},
+        {"concentrate": "B液", "pack_size_ml": 50, "price": 8,
+         "arrival_date": "2026-05-01", "max_packs": 5}])).json()
+    assert d["feasible"] is False
+    assert d["first_gap"]["index"] == 5
+    assert d["first_gap"]["attributed_date"] == "2026-05-03"
+    print("47) procurement: supply cap gap at first day-3 batch")
+
+    # 48) arrival on the batch day serves that day's first batch --------- #
+    d = client.post(pr_url, json=pr_body(
+        stock=[{"concentrate": "A液", "stock_ml": 300},
+               {"concentrate": "B液", "stock_ml": 100000}],
+        quotes=[{"concentrate": "A液", "pack_size_ml": 200, "price": 10,
+                 "arrival_date": "2026-05-03", "max_packs": 5}])).json()
+    assert d["feasible"] is True
+    assert d["quotes"][0]["packs"] == 1
+    day3 = [b for b in d["batches"] if b["attributed_date"] == "2026-05-03"]
+    assert [x["concentrate"] for x in day3[0]["inbound"]] == ["A液"]
+    assert day3[1]["inbound"] == []
+    print("48) procurement: same-day arrival inbound before first batch")
+
+    # 49) no quotes: sufficient stock -> zero order; short -> gap --------- #
+    d = client.post(pr_url, json=pr_body(
+        quotes=[],
+        stock=[{"concentrate": "A液", "stock_ml": 100000},
+               {"concentrate": "B液", "stock_ml": 100000}])).json()
+    assert d["feasible"] is True and d["total_packs"] == 0
+    assert d["total_price"] == 0 and d["quotes"] == []
+    d = client.post(pr_url, json=pr_body(quotes=[])).json()
+    assert d["feasible"] is False and d["first_gap"]["index"] == 1
+    print("49) procurement: empty quotes feasible / gap cases")
+
+    # 50) suspended day: arrival on suspended date enters next batch ----- #
+    # B demand day1 = 12.5 (incl. cross-midnight batch); stock 12.5
+    # covers it. Whole-plan B need 25 (days 1+3 only); the 50 mL pack
+    # arrives on suspended 05-02, enters before the first 05-03 batch.
+    d = client.post(pr_url, json=pr_body(
+        suspended_dates=["2026-05-02"],
+        stock=[{"concentrate": "A液", "stock_ml": 100000},
+               {"concentrate": "B液", "stock_ml": 12.5}],
+        quotes=[{"concentrate": "B液", "pack_size_ml": 50, "price": 8,
+                 "arrival_date": "2026-05-02", "max_packs": 5}])).json()
+    assert d["feasible"] is True, d
+    assert d["suspended_dates"] == ["2026-05-02"]
+    assert d["planned_water_ml"] == 2000
+    assert d["quotes"][0]["packs"] == 1
+    day1 = [b for b in d["batches"] if b["attributed_date"] == "2026-05-01"]
+    day3 = [b for b in d["batches"] if b["attributed_date"] == "2026-05-03"]
+    assert all(b["inbound"] == [] for b in day1)
+    assert [x["concentrate"] for x in day3[0]["inbound"]] == ["B液"]
+    assert day3[1]["inbound"] == []
+    print("50) procurement: suspended-day arrival enters next active batch")
+
+    # 51) 404 / 422 validation -------------------------------------------- #
+    assert client.post(
+        "/api/recipes/999/versions/1/procurement-plan",
+        json=pr_body()).status_code == 404
+    assert client.post(
+        f"/api/recipes/{pr_rid}/versions/99/procurement-plan",
+        json=pr_body()).status_code == 404
+
+    def pr_422(overrides, label):
+        rr = client.post(pr_url, json=pr_body(**overrides))
+        assert rr.status_code == 422, (label, rr.status_code, rr.text[:300])
+
+    pr_422({"stock": [{"concentrate": "A液", "stock_ml": 1},
+                      {"concentrate": "C液", "stock_ml": 1}]},
+           "unknown stock")
+    pr_422({"stock": [{"concentrate": "A液", "stock_ml": 1}]},
+           "missing stock")
+    pr_422({"stock": [{"concentrate": "A液", "stock_ml": 1},
+                      {"concentrate": "A液", "stock_ml": 1},
+                      {"concentrate": "B液", "stock_ml": 1}]},
+           "duplicate stock")
+    pr_422({"stock": [{"concentrate": "A液", "stock_ml": -1},
+                      {"concentrate": "B液", "stock_ml": 1}]},
+           "negative stock")
+    pr_422({"stock": []}, "empty stock")
+
+    def quote_body(q):
+        return pr_body(quotes=q + [{
+            "concentrate": "B液", "pack_size_ml": 50, "price": 8,
+            "arrival_date": "2026-05-01", "max_packs": 5}])
+
+    pr_422(quote_body([{"concentrate": "C液", "pack_size_ml": 1, "price": 1,
+                        "arrival_date": "2026-05-01", "max_packs": 1}]),
+           "unknown quote concentrate")
+    pr_422(quote_body([{"concentrate": "A液", "pack_size_ml": 0, "price": 5,
+                        "arrival_date": "2026-05-01", "max_packs": 1}]),
+           "zero pack size")
+    pr_422(quote_body([{"concentrate": "A液", "pack_size_ml": -10, "price": 5,
+                        "arrival_date": "2026-05-01", "max_packs": 1}]),
+           "negative pack size")
+    pr_422(quote_body([{"concentrate": "A液", "pack_size_ml": 10, "price": 0,
+                        "arrival_date": "2026-05-01", "max_packs": 1}]),
+           "zero price")
+    pr_422(quote_body([{"concentrate": "A液", "pack_size_ml": 10, "price": -1,
+                        "arrival_date": "2026-05-01", "max_packs": 1}]),
+           "negative price")
+    pr_422(quote_body([{"concentrate": "A液", "pack_size_ml": 10, "price": 5,
+                        "arrival_date": "2026-04-30", "max_packs": 1}]),
+           "arrival before range")
+    pr_422(quote_body([{"concentrate": "A液", "pack_size_ml": 10, "price": 5,
+                        "arrival_date": "2026-05-04", "max_packs": 1}]),
+           "arrival after range")
+    pr_422(quote_body([{"concentrate": "A液", "pack_size_ml": 10, "price": 5,
+                        "arrival_date": "2026-05-01", "max_packs": 0}]),
+           "zero max packs")
+    pr_422(quote_body([{"concentrate": "A液", "pack_size_ml": "10", "price": 5,
+                        "arrival_date": "2026-05-01", "max_packs": 1}]),
+           "string pack size")
+    pr_422({"timezone": "Mars/Olympus"}, "bad timezone")
+    pr_422({"end_date": "2026-04-30"}, "bad date range")
+    pr_422({"sessions": []}, "empty sessions")
+    bad_pr = pr_body()
+    bad_pr["bogus"] = 1
+    pr_422(bad_pr, "extra top-level field")
+    bad_q = quote_body([{"concentrate": "A液", "pack_size_ml": 10, "price": 5,
+                         "arrival_date": "2026-05-01", "max_packs": 1,
+                         "bogus": 1}])
+    pr_422(bad_q, "extra quote field")
+    # NaN / Infinity raw JSON tokens -> 422
+    for token in ("NaN", "Infinity"):
+        rr = client.post(
+            pr_url,
+            content=(
+                '{"timezone":"Asia/Shanghai","start_date":"2026-05-01",'
+                '"end_date":"2026-05-03",'
+                '"sessions":[{"start_time":"08:00","duration_minutes":10,'
+                '"water_ml":500}],'
+                '"stock":[{"concentrate":"A液","stock_ml":1},'
+                '{"concentrate":"B液","stock_ml":1}],'
+                '"quotes":[{"concentrate":"A液","pack_size_ml":' + token +
+                ',"price":5,"arrival_date":"2026-05-01","max_packs":1}]}'),
+            headers={"Content-Type": "application/json"})
+        assert rr.status_code == 422, (token, rr.status_code)
+    # domain-level mismatch message names the bad concentrate
+    rr = client.post(pr_url, json=quote_body([
+        {"concentrate": "X液", "pack_size_ml": 1, "price": 1,
+         "arrival_date": "2026-05-01", "max_packs": 1}]))
+    assert "X液" in rr.json()["detail"]["message"]
+    print("51) procurement 404/422 validation all ok")
+
+    # 52) force-saved infeasible version: warning but plan computed ------ #
+    d = client.post(
+        f"/api/recipes/{bad_id}/versions/1/procurement-plan",
+        json=pr_body(
+            stock=[{"concentrate": "A液", "stock_ml": 100000},
+                   {"concentrate": "B液", "stock_ml": 100000}],
+            quotes=[])).json()
+    assert d["recipe_feasible"] is False
+    assert d["warning"] and "不可行" in d["warning"]
+    print("52) procurement on infeasible version carries warning")
+
 print("\nALL SMOKE TESTS PASSED")
